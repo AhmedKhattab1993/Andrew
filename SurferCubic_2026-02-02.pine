@@ -169,7 +169,9 @@ computeAdaptiveDivisor(currentRegressionSlope) =>
     maxSlope = array.max(absoluteSlopeHistory)
 
     // Normalize current absolute slope directly to the [1, maxAdaptiveDivisor] range for adaptive scaling
-    currentAdaptiveDivisor = maxSlope > minSlope ? (math.abs(currentRegressionSlope) - minSlope) / (maxSlope - minSlope) * (maxAdaptiveDivisor - 1.0) + 1.0 : 1.0
+    currentAdaptiveDivisorPreFilter = maxSlope > minSlope ? (math.abs(currentRegressionSlope) - minSlope) / (maxSlope - minSlope) * (maxAdaptiveDivisor - 1.0) + 1.0 : 1.0
+    currentAdaptiveDivisor = ta.alma(currentAdaptiveDivisorPreFilter, 9, 0.90, 6)
+    currentAdaptiveDivisor := na(currentAdaptiveDivisor) ? currentAdaptiveDivisorPreFilter : currentAdaptiveDivisor
     currentAdaptiveDivisor := math.min(maxAdaptiveDivisor, math.max(1.0, currentAdaptiveDivisor))
     currentAdaptiveDivisor
 
