@@ -387,7 +387,7 @@ if barstate.isconfirmed
     priorSlopeState := slopeState
 
 // Draw the cubic curve
-if barstate.isconfirmed or barstate.islast
+if barstate.isconfirmed or bar_index == last_bar_index
     curvePoints = array.new<chart.point>()
 
     // The regression is calculated over int(adaptedRegressionLength) bars
@@ -450,7 +450,7 @@ if inBacktestWindow and shouldEnterShort
 
 // Display adaptive length info
 var table infoTable = table.new(position.top_right, 2, 3)
-if barstate.islast and showLengthInfo
+if bar_index == last_bar_index and showLengthInfo
     slopeDisplayColor = currentRegressionSlope > 0 ? color.green : color.red  // Positive = bullish (green), Negative = bearish (red)
 
     table.cell(infoTable, 0, 0, "Current Length:", text_color=color.white, bgcolor=color.gray)
