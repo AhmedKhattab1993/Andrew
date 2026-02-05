@@ -1,0 +1,465 @@
+//@version=6
+strategy("SurferCubic 2025-12-18", overlay=true, max_lines_count=100, max_polylines_count=10, max_labels_count=500, margin_long=0, margin_short=0)
+
+// Input parameters
+baseLength = input.int(50, "Base Regression Period", minval=1, maxval=200000, tooltip="Default window length for cubic regression before adaptive scaling")
+allowLongTrades = input.bool(true, "Enable Long Trades", group="Trade Direction", tooltip="Allow the strategy to take long entries")
+allowShortTrades = input.bool(true, "Enable Short Trades", group="Trade Direction", tooltip="Allow the strategy to take short entries")
+normalizedSlopeThresholdInput = input.float(0.0, "Normalized Slope Threshold", minval=0.0, maxval=1.0, step=0.01, tooltip="Minimum normalized slope (0-1) required to enable trades (0 = no filter)")
+
+var transientHandlingGroup = "Transient Handling"
+
+enableDelayedEntryToggle = input.bool(false, "Delayed", inline="th_delay", group=transientHandlingGroup, tooltip="Require a signal to remain valid for N bars before entry")
+delayedEntryBars = input.int(3, "Bars", minval=1, maxval=2000, inline="th_delay", tooltip="Bars a signal must remain valid before entry when Delayed is enabled", group=transientHandlingGroup)
+
+enableCooldownToggle = input.bool(false, "Cooldown", inline="th_cooldown", group=transientHandlingGroup, tooltip="After an order, wait N bars before allowing a new entry")
+cooldownWaitBars = input.int(3, "Bars", minval=0, maxval=2000, inline="th_cooldown", tooltip="Bars to wait after an order before allowing a new entry when Cooldown is enabled", group=transientHandlingGroup)
+
+showTransientSkipMarkers = input.bool(true, "Show Skipped Signal Markers", group=transientHandlingGroup, tooltip="Draw grey arrows when a delayed/cooldown signal is skipped or ignored")
+
+// Adaptive Length Parameters
+useAdaptiveLength = input.bool(true, "Use Adaptive Length", tooltip="Enable dynamic adjustment of regression length based on normalized slope", group="Adaptive Settings")
+slopeNormalizationLookback = input.int(250, "Slope Lookback Period", minval=1, maxval=20000, tooltip="Number of bars tracked to compute slope min/max for normalization", group="Adaptive Settings")
+maxAdaptiveDivisor = input.float(2.0, "Maximum Length Divisor", minval=1.0, maxval=20000, step=0.1, tooltip="Upper bound for the adaptive length divisor", group="Adaptive Settings")
+showLengthInfo = input.bool(true, "Show Length Info", tooltip="Toggle the on-chart table with current length, slope, and normalized slope", group="Adaptive Settings")
+
+backtestStart = input.time(timestamp("2020-01-01T00:00:00"), "Backtest Start Date", tooltip="Trades before this date are ignored", group="Backtest Window")
+backtestEnd = input.time(timestamp("2099-12-31T23:59:59"), "Backtest End Date", tooltip="Trades after this date are ignored", group="Backtest Window")
+
+var polyline regressionPolyline = na
+var float confirmedRegressionLength = float(baseLength)
+var float[] absoluteSlopeHistory = array.new_float(slopeNormalizationLookback, 0.0)
+
+// Transient handling state
+var int longDelayCounter = 0
+var int shortDelayCounter = 0
+var bool isLongDelayActive = false
+var bool isShortDelayActive = false
+var bool isCooldownActive = false
+var int cooldownElapsedBars = 0
+var int pendingCooldownDirection = 0
+var int pendingLongSignalIndex = na
+var int pendingShortSignalIndex = na
+var int pendingLongDelaySignalIndex = na
+var int pendingShortDelaySignalIndex = na
+
+// Signal state
+var int priorSlopeState = na
+
+calculateCubicRegression(src, len) =>
+    var float[] xValues = array.new_float()
+    var float[] yValues = array.new_float()
+
+    array.clear(xValues)
+    array.clear(yValues)
+
+    intLen = int(len)
+
+    for i = 0 to intLen - 1
+        array.push(xValues, float(i))
+        array.push(yValues, src[i])
+
+    n = intLen
+
+    sumX = 0.0
+    sumX2 = 0.0
+    sumX3 = 0.0
+    sumX4 = 0.0
+    sumX5 = 0.0
+    sumX6 = 0.0
+    sumY = 0.0
+    sumXY = 0.0
+    sumX2Y = 0.0
+    sumX3Y = 0.0
+
+    for i = 0 to n - 1
+        x = array.get(xValues, i)
+        y = array.get(yValues, i)
+        x2 = x * x
+        x3 = x2 * x
+        x4 = x3 * x
+        x5 = x4 * x
+        x6 = x5 * x
+
+        sumX += x
+        sumX2 += x2
+        sumX3 += x3
+        sumX4 += x4
+        sumX5 += x5
+        sumX6 += x6
+        sumY += y
+        sumXY += x * y
+        sumX2Y += x2 * y
+        sumX3Y += x3 * y
+
+    a11 = n
+    a12 = sumX
+    a13 = sumX2
+    a14 = sumX3
+    a21 = sumX
+    a22 = sumX2
+    a23 = sumX3
+    a24 = sumX4
+    a31 = sumX2
+    a32 = sumX3
+    a33 = sumX4
+    a34 = sumX5
+    a41 = sumX3
+    a42 = sumX4
+    a43 = sumX5
+    a44 = sumX6
+
+    b1 = sumY
+    b2 = sumXY
+    b3 = sumX2Y
+    b4 = sumX3Y
+
+    det = a11*(a22*(a33*a44-a34*a43)-a23*(a32*a44-a34*a42)+a24*(a32*a43-a33*a42)) -
+          a12*(a21*(a33*a44-a34*a43)-a23*(a31*a44-a34*a41)+a24*(a31*a43-a33*a41)) +
+          a13*(a21*(a32*a44-a34*a42)-a22*(a31*a44-a34*a41)+a24*(a31*a42-a32*a41)) -
+          a14*(a21*(a32*a43-a33*a42)-a22*(a31*a43-a33*a41)+a23*(a31*a42-a32*a41))
+
+    if det == 0
+        [0.0, 0.0, 0.0, 0.0]
+    else
+        c0_det = b1*(a22*(a33*a44-a34*a43)-a23*(a32*a44-a34*a42)+a24*(a32*a43-a33*a42)) -
+                 a12*(b2*(a33*a44-a34*a43)-a23*(b3*a44-a34*b4)+a24*(b3*a43-a33*b4)) +
+                 a13*(b2*(a32*a44-a34*a42)-a22*(b3*a44-a34*b4)+a24*(b3*a42-a32*b4)) -
+                 a14*(b2*(a32*a43-a33*a42)-a22*(b3*a43-a33*b4)+a23*(b3*a42-a32*b4))
+
+        c1_det = a11*(b2*(a33*a44-a34*a43)-a23*(b3*a44-a34*b4)+a24*(b3*a43-a33*b4)) -
+                 b1*(a21*(a33*a44-a34*a43)-a23*(a31*a44-a34*a41)+a24*(a31*a43-a33*a41)) +
+                 a13*(a21*(b3*a44-a34*b4)-b2*(a31*a44-a34*a41)+a24*(a31*b4-b3*a41)) -
+                 a14*(a21*(b3*a43-a33*b4)-b2*(a31*a43-a33*a41)+a23*(a31*b4-b3*a41))
+
+        c2_det = a11*(a22*(b3*a44-a34*b4)-b2*(a32*a44-a34*a42)+a24*(a32*b4-b3*a42)) -
+                 a12*(a21*(b3*a44-a34*b4)-b2*(a31*a44-a34*a41)+a24*(a31*b4-b3*a41)) +
+                 b1*(a21*(a32*a44-a34*a42)-a22*(a31*a44-a34*a41)+a24*(a31*a42-a32*a41)) -
+                 a14*(a21*(a32*b4-b3*a42)-a22*(a31*b4-b3*a41)+b2*(a31*a42-a32*a41))
+
+        c3_det = a11*(a22*(a33*b4-b3*a43)-a23*(a32*b4-b3*a42)+b2*(a32*a43-a33*a42)) -
+                 a12*(a21*(a33*b4-b3*a43)-a23*(a31*b4-b3*a41)+b2*(a31*a43-a33*a41)) +
+                 a13*(a21*(a32*b4-b3*a42)-a22*(a31*b4-b3*a41)+b2*(a31*a42-a32*a41)) -
+                 b1*(a21*(a32*a43-a33*a42)-a22*(a31*a43-a33*a41)+a23*(a31*a42-a32*a41))
+
+        c0 = c0_det / det
+        c1 = c1_det / det
+        c2 = c2_det / det
+        c3 = c3_det / det
+
+        [c0, c1, c2, c3]
+
+evaluateCubic(x, c0, c1, c2, c3) =>
+    c0 + c1*x + c2*x*x + c3*x*x*x
+
+// Calculate the derivative (slope) at a given x
+// For f(x) = c0 + c1*x + c2*x² + c3*x³
+// f'(x) = c1 + 2*c2*x + 3*c3*x²
+// Negate to match visual slope (since x increases going back in time)
+calculateRegressionSlope(x, c1, c2, c3) =>
+    -(c1 + 2*c2*x + 3*c3*x*x)
+
+// Update slope history and calculate adaptive divisor
+computeAdaptiveDivisor(currentRegressionSlope) =>
+    array.shift(absoluteSlopeHistory)
+    array.push(absoluteSlopeHistory, math.abs(currentRegressionSlope))
+
+    // Calculate min and max from history
+    minSlope = array.min(absoluteSlopeHistory)
+    maxSlope = array.max(absoluteSlopeHistory)
+
+    // Normalize current absolute slope directly to the [1, maxAdaptiveDivisor] range for adaptive scaling
+    currentAdaptiveDivisor = maxSlope > minSlope ? (math.abs(currentRegressionSlope) - minSlope) / (maxSlope - minSlope) * (maxAdaptiveDivisor - 1.0) + 1.0 : 1.0
+    currentAdaptiveDivisor := math.min(maxAdaptiveDivisor, math.max(1.0, currentAdaptiveDivisor))
+    currentAdaptiveDivisor
+
+// Calculate adaptive length based on adaptive divisor
+determineAdaptiveLength(currentAdaptiveDivisor) =>
+    if useAdaptiveLength
+        // Apply adaptive divisor directly to the base length and guard against sub-bar lengths
+        math.max(1.0, baseLength / currentAdaptiveDivisor)
+    else
+        float(baseLength)
+
+// First calculate with previous length to get slope for adaptation
+[c0_prev, c1_prev, c2_prev, c3_prev] = calculateCubicRegression(close, confirmedRegressionLength)
+slopeSampleForAdaptation = calculateRegressionSlope(0, c1_prev, c2_prev, c3_prev)
+
+// Update slope history and calculate new adaptive length
+currentAdaptiveDivisor = computeAdaptiveDivisor(slopeSampleForAdaptation)
+adaptedRegressionLength = determineAdaptiveLength(currentAdaptiveDivisor)
+
+// Now calculate with the current adaptive length for signals and drawing
+[c0, c1, c2, c3] = calculateCubicRegression(close, adaptedRegressionLength)
+currentRegressionSlope = calculateRegressionSlope(0, c1, c2, c3)
+
+// Update stored adaptive length on bar confirmation
+if barstate.isconfirmed
+    confirmedRegressionLength := adaptedRegressionLength
+
+// Backtest window handling
+dateRangeValid = backtestStart <= backtestEnd
+inBacktestWindow = dateRangeValid and time >= backtestStart and time <= backtestEnd
+
+if not inBacktestWindow
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all("Outside Backtest Window")
+
+// -----------------------------
+// Normalized Slope Threshold (FIXED)
+// -----------------------------
+isSlopeThresholdActive = normalizedSlopeThresholdInput > 0.0
+requiredAdaptiveDivisor = isSlopeThresholdActive ? 1.0 + normalizedSlopeThresholdInput * (maxAdaptiveDivisor - 1.0) : 1.0
+slopeMeetsThreshold = not isSlopeThresholdActive or currentAdaptiveDivisor >= requiredAdaptiveDivisor
+
+// slopeState:  1 = bullish and above threshold, -1 = bearish and above threshold, 0 = below threshold or flat slope
+slopeState = slopeMeetsThreshold ? (currentRegressionSlope > 0 ? 1 : currentRegressionSlope < 0 ? -1 : 0) : 0
+isSlopePositive = slopeState == 1
+isSlopeNegative = slopeState == -1
+
+// Signal when slopeState flips into bullish/bearish (covers both sign flips and threshold re-entry)
+longSlopeSignal = not na(priorSlopeState) and slopeState == 1 and priorSlopeState <= 0
+shortSlopeSignal = not na(priorSlopeState) and slopeState == -1 and priorSlopeState >= 0
+
+useDelayedEntry = enableDelayedEntryToggle
+useCooldown = enableCooldownToggle
+
+// Track signals even when a direction is disabled if needed to manage exits.
+trackLongSignals = allowLongTrades or strategy.position_size < 0
+trackShortSignals = allowShortTrades or strategy.position_size > 0
+
+bool rawShouldEnterLong = false
+bool rawShouldEnterShort = false
+
+bool longCandidate = trackLongSignals and longSlopeSignal
+bool shortCandidate = trackShortSignals and shortSlopeSignal
+
+bool delayedReadyLong = false
+bool delayedReadyShort = false
+int delayedReadyLongOriginIndex = na
+int delayedReadyShortOriginIndex = na
+
+drawSkippedMarker(isLong, barsAgo) =>
+    if showTransientSkipMarkers and barsAgo >= 0 and barsAgo <= bar_index
+        float priceValue = na
+        if isLong
+            priceValue := nz(low[barsAgo], close[barsAgo]) - syminfo.mintick
+        else
+            priceValue := nz(high[barsAgo], close[barsAgo]) + syminfo.mintick
+        labelStyle = isLong ? label.style_arrowup : label.style_arrowdown
+        label.new(bar_index - barsAgo, priceValue, "", xloc=xloc.bar_index, style=labelStyle, color=color.gray, textcolor=color.gray, size=size.tiny)
+
+if barstate.isconfirmed
+    if not inBacktestWindow
+        isLongDelayActive := false
+        isShortDelayActive := false
+        longDelayCounter := 0
+        shortDelayCounter := 0
+        pendingLongDelaySignalIndex := na
+        pendingShortDelaySignalIndex := na
+
+        isCooldownActive := false
+        cooldownElapsedBars := 0
+        pendingCooldownDirection := 0
+        pendingLongSignalIndex := na
+        pendingShortSignalIndex := na
+    else
+        if not useDelayedEntry
+            isLongDelayActive := false
+            isShortDelayActive := false
+            longDelayCounter := 0
+            shortDelayCounter := 0
+            pendingLongDelaySignalIndex := na
+            pendingShortDelaySignalIndex := na
+
+        if not useCooldown or cooldownWaitBars <= 0
+            isCooldownActive := false
+            cooldownElapsedBars := 0
+            pendingCooldownDirection := 0
+            pendingLongSignalIndex := na
+            pendingShortSignalIndex := na
+
+if useDelayedEntry and barstate.isconfirmed and inBacktestWindow
+    // Start delayed confirmation on a slope-state flip (even if that direction is disabled),
+    // but only if it's relevant for entries OR for exiting an existing position.
+    if longCandidate
+        isLongDelayActive := true
+        longDelayCounter := 0
+        pendingLongDelaySignalIndex := bar_index
+    if shortCandidate
+        isShortDelayActive := true
+        shortDelayCounter := 0
+        pendingShortDelaySignalIndex := bar_index
+
+    if isLongDelayActive
+        if isSlopePositive
+            longDelayCounter += 1
+            if longDelayCounter >= delayedEntryBars
+                delayedReadyLong := true
+                delayedReadyLongOriginIndex := pendingLongDelaySignalIndex
+                pendingLongDelaySignalIndex := na
+                isLongDelayActive := false
+                longDelayCounter := 0
+        else
+            if not na(pendingLongDelaySignalIndex)
+                drawSkippedMarker(true, bar_index - pendingLongDelaySignalIndex)
+            pendingLongDelaySignalIndex := na
+            isLongDelayActive := false
+            longDelayCounter := 0
+
+    if isShortDelayActive
+        if isSlopeNegative
+            shortDelayCounter += 1
+            if shortDelayCounter >= delayedEntryBars
+                delayedReadyShort := true
+                delayedReadyShortOriginIndex := pendingShortDelaySignalIndex
+                pendingShortDelaySignalIndex := na
+                isShortDelayActive := false
+                shortDelayCounter := 0
+        else
+            if not na(pendingShortDelaySignalIndex)
+                drawSkippedMarker(false, bar_index - pendingShortDelaySignalIndex)
+            pendingShortDelaySignalIndex := na
+            isShortDelayActive := false
+            shortDelayCounter := 0
+else if not useDelayedEntry
+    delayedReadyLong := longCandidate
+    delayedReadyShort := shortCandidate
+
+if useCooldown
+    if cooldownWaitBars <= 0 or not isCooldownActive
+        rawShouldEnterLong := delayedReadyLong
+        rawShouldEnterShort := delayedReadyShort
+    else if inBacktestWindow
+        // Queue ready signals during cooldown (also used to exit if opposite direction is disabled).
+        if delayedReadyLong
+            pendingCooldownDirection := 1
+            if na(pendingLongSignalIndex)
+                pendingLongSignalIndex := not na(delayedReadyLongOriginIndex) ? delayedReadyLongOriginIndex : bar_index
+        if delayedReadyShort
+            pendingCooldownDirection := -1
+            if na(pendingShortSignalIndex)
+                pendingShortSignalIndex := not na(delayedReadyShortOriginIndex) ? delayedReadyShortOriginIndex : bar_index
+
+    if barstate.isconfirmed and inBacktestWindow
+        if isCooldownActive
+            cooldownElapsedBars += 1
+            if cooldownElapsedBars >= cooldownWaitBars
+                isCooldownActive := false
+                cooldownElapsedBars := 0
+
+                // Evaluate queued cooldown signals. Grey arrows are drawn for any queued signal that does not execute.
+                if pendingCooldownDirection == 1
+                    if isSlopePositive and trackLongSignals
+                        rawShouldEnterLong := true
+                    else
+                        if not na(pendingLongSignalIndex)
+                            drawSkippedMarker(true, bar_index - pendingLongSignalIndex)
+
+                    // If we also saw an opposite-direction signal during cooldown, it was skipped/ignored.
+                    if not na(pendingShortSignalIndex)
+                        drawSkippedMarker(false, bar_index - pendingShortSignalIndex)
+
+                else if pendingCooldownDirection == -1
+                    if isSlopeNegative and trackShortSignals
+                        rawShouldEnterShort := true
+                    else
+                        if not na(pendingShortSignalIndex)
+                            drawSkippedMarker(false, bar_index - pendingShortSignalIndex)
+
+                    // If we also saw an opposite-direction signal during cooldown, it was skipped/ignored.
+                    if not na(pendingLongSignalIndex)
+                        drawSkippedMarker(true, bar_index - pendingLongSignalIndex)
+
+                pendingLongSignalIndex := na
+                pendingShortSignalIndex := na
+                pendingCooldownDirection := 0
+        else
+            pendingCooldownDirection := 0
+            cooldownElapsedBars := 0
+else
+    rawShouldEnterLong := delayedReadyLong
+    rawShouldEnterShort := delayedReadyShort
+
+// Persist slope state for next-bar comparisons
+if barstate.isconfirmed
+    priorSlopeState := slopeState
+
+// Draw the cubic curve
+if barstate.isconfirmed or barstate.islast
+    curvePoints = array.new<chart.point>()
+
+    // The regression is calculated over int(adaptedRegressionLength) bars
+    polylineRegressionLength = int(adaptedRegressionLength)
+    polylineSegments = math.min(polylineRegressionLength - 1, 100)
+    polylineSegments := math.max(polylineSegments, 1)
+
+    for i = 0 to polylineSegments
+        // Map i to fractional x coordinates matching the regression calculation
+        x = i * (polylineRegressionLength - 1) / polylineSegments
+
+        // Translate fractional x distance (bars back) into a bar_index coordinate
+        indexCoord = bar_index - x
+        yValue = evaluateCubic(x, c0, c1, c2, c3)
+
+        array.push(curvePoints, chart.point.new(time=na, index=indexCoord, price=yValue))
+
+    if not na(regressionPolyline)
+        polyline.delete(regressionPolyline)
+
+    regressionPolyline := polyline.new(curvePoints, closed=false, curved=false, line_color=color.blue, line_width=2, xloc=xloc.bar_index)
+
+// Plot current cubic value
+currentCurveValue = evaluateCubic(0, c0, c1, c2, c3)
+plot(currentCurveValue, "Current Cubic Value", color=color.blue, linewidth=1, display=display.none)
+
+// Respect user trade direction toggles before sending orders
+shouldEnterLong = allowLongTrades and rawShouldEnterLong
+shouldEnterShort = allowShortTrades and rawShouldEnterShort
+
+// If a direction is disabled, close existing positions when the opposite signal fires
+if inBacktestWindow
+    if not allowShortTrades and rawShouldEnterShort and strategy.position_size > 0
+        strategy.close("Long", comment="Short (disabled)")
+    if not allowLongTrades and rawShouldEnterLong and strategy.position_size < 0
+        strategy.close("Short", comment="Long (disabled)")
+
+// Strategy entries
+if inBacktestWindow and shouldEnterLong
+    strategy.entry("Long", strategy.long)
+    if useCooldown and cooldownWaitBars > 0
+        isCooldownActive := true
+        cooldownElapsedBars := 0
+        pendingCooldownDirection := 0
+    pendingLongSignalIndex := na
+    pendingLongDelaySignalIndex := na
+
+if inBacktestWindow and shouldEnterShort
+    strategy.entry("Short", strategy.short)
+    if useCooldown and cooldownWaitBars > 0
+        isCooldownActive := true
+        cooldownElapsedBars := 0
+        pendingCooldownDirection := 0
+    pendingShortSignalIndex := na
+    pendingShortDelaySignalIndex := na
+
+// Alert conditions for real-time trade signals (entries only)
+// alertcondition(inBacktestWindow and shouldEnterLong, "Long Trade Alert", "Long entry triggered on {{ticker}} ({{interval}})")
+// alertcondition(inBacktestWindow and shouldEnterShort, "Short Trade Alert", "Short entry triggered on {{ticker}} ({{interval}})")
+
+// Display adaptive length info
+var table infoTable = table.new(position.top_right, 2, 3)
+if barstate.islast and showLengthInfo
+    slopeDisplayColor = currentRegressionSlope > 0 ? color.green : color.red  // Positive = bullish (green), Negative = bearish (red)
+
+    table.cell(infoTable, 0, 0, "Current Length:", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 0, str.tostring(int(adaptedRegressionLength)), text_color=color.yellow, bgcolor=color.gray)
+    table.cell(infoTable, 0, 1, "Slope:", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 1, str.tostring(currentRegressionSlope, "#.####"), text_color=slopeDisplayColor, bgcolor=color.gray)
+    table.cell(infoTable, 0, 2, "Adaptive Divisor:", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 2, str.tostring(currentAdaptiveDivisor, "#.##"), text_color=color.aqua, bgcolor=color.gray)
+
+// Notes
+// - Delayed Entry now still confirms opposite-direction signals when needed to exit an open position (even if that entry direction is disabled).
+// - Normalized Slope Threshold signals now trigger on slope-state transitions (bull/bear + threshold) rather than only on a magnitude-threshold crossing.
