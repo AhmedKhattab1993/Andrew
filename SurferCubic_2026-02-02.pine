@@ -1,5 +1,5 @@
 //@version=6
-strategy("SurferCubic 2025-12-18", overlay=true, max_lines_count=100, max_polylines_count=10, max_labels_count=500, margin_long=0, margin_short=0)
+strategy("SurferCubic 2026-2-2", overlay=true, max_lines_count=100, max_polylines_count=10, max_labels_count=500, margin_long=0, margin_short=0)
 
 // Input parameters
 baseLength = input.int(50, "Base Regression Period", minval=1, maxval=200000, tooltip="Default window length for cubic regression before adaptive scaling")
